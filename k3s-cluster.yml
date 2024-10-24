@@ -1,0 +1,228 @@
+---
+- name: Set up K3s Cluster with Load Balanced HTTP Service
+  hosts: all
+  become: yes
+  become_method: sudo
+  vars:
+    k3s_version: v1.26.1+k3s1
+    api_port: 8080
+    master_node: "{{ groups['master'][0] }}"
+    master_ip: "{{ hostvars[master_node]['ansible_host'] }}"
+
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - python3-pip
+          - ufw
+        state: present
+        update_cache: yes
+
+    # Configure firewall rules
+    - name: Configure firewall rules on master
+      when: inventory_hostname in groups['master']
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      with_items:
+        - 6443  # Kubernetes API
+        - 8472  # Flannel VXLAN
+        - 10250  # Kubelet
+        - 2379  # ETCD client
+        - 2380  # ETCD peer
+        - 80  # HTTP server
+        - 30080 # NodePort
+
+    - name: Configure firewall rules on workers
+      when: inventory_hostname in groups['worker']
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      with_items:
+        - 8472  # Flannel VXLAN
+        - 10250  # Kubelet
+        - 80  # HTTP server
+        - 30080 # NodePort
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+        policy: allow
+
+    - name: Create Python HTTP server script
+      copy:
+        dest: /opt/http_server.py
+        mode: '0755'
+        content: |
+          from http.server import HTTPServer, BaseHTTPRequestHandler
+          import socket
+
+          class SimpleHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  self.send_response(200)
+                  self.send_header('Content-type', 'text/plain')
+                  self.end_headers()
+                  hostname = socket.gethostname()
+                  response = f"Hello from {hostname}!\n"
+                  self.wfile.write(response.encode())
+
+          if __name__ == '__main__':
+              server = HTTPServer(('0.0.0.0', 80), SimpleHandler)
+              print('Starting server on port 80...')
+              server.serve_forever()
+
+    - name: Create systemd service for HTTP server
+      copy:
+        dest: /etc/systemd/system/http-server.service
+        content: |
+          [Unit]
+          Description=Simple Python HTTP Server
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/bin/python3 /opt/http_server.py
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Start HTTP server service
+      systemd:
+        name: http-server
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Install K3s on master node
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} sh -s - server \
+          --node-external-ip {{ master_ip }} \
+          --flannel-backend=host-gw \
+          --advertise-address={{ master_ip }} \
+          --bind-address={{ master_ip }} \
+          --node-ip={{ master_ip }}
+      when: inventory_hostname in groups['master']
+
+    - name: Ensure K3s service is running on master
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+      when: inventory_hostname in groups['master']
+
+    - name: Wait for K3s to be ready on master
+      wait_for:
+        path: /etc/rancher/k3s/k3s.yaml
+      when: inventory_hostname in groups['master']
+
+    - name: Get K3s token from master
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+      when: inventory_hostname in groups['master']
+
+    - name: Set fact for K3s token on all hosts
+      set_fact:
+        k3s_node_token: "{{ hostvars[groups['master'][0]]['k3s_token']['content'] | b64decode | trim }}"
+
+    - name: Debug worker node IP configuration
+      when: inventory_hostname in groups['worker']
+      debug:
+        msg: "Worker {{ inventory_hostname }} IP: {{ ansible_default_ipv4.address }}"
+
+    - name: Join worker nodes
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} K3S_URL="https://{{ master_ip }}:6443" \
+        K3S_TOKEN="{{ k3s_node_token }}" \
+        K3S_NODE_IP="{{ ansible_default_ipv4.address }}" \
+        sh -s - agent \
+        --flannel-backend=host-gw \
+        --node-ip="{{ ansible_default_ipv4.address }}"
+      when: inventory_hostname in groups['worker']
+      register: worker_join
+      ignore_errors: yes
+
+    - name: Debug worker join output
+      debug:
+        var: worker_join
+      when: inventory_hostname in groups['worker']
+
+    - name: Check k3s-agent logs if join failed
+      shell: journalctl -u k3s-agent -n 50
+      register: agent_logs
+      when: inventory_hostname in groups['worker'] and worker_join.rc is defined and worker_join.rc != 0
+
+    - name: Display k3s-agent logs
+      debug:
+        var: agent_logs.stdout_lines
+      when: inventory_hostname in groups['worker'] and worker_join.rc is defined and worker_join.rc != 0
+
+    - name: Install kubectl on master
+      shell: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        mv kubectl /usr/local/bin/
+      when: inventory_hostname in groups['master']
+
+    - name: Wait for nodes to be ready
+      shell: kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml get nodes
+      register: node_status
+      until: node_status.stdout.find("Ready") != -1
+      retries: 10
+      delay: 30
+      when: inventory_hostname in groups['master']
+
+    - name: Create load balanced service deployment
+      shell: |
+        kubectl --kubeconfig /etc/rancher/k3s/k3s.yaml apply -f - <<EOF
+        apiVersion: apps/v1
+        kind: DaemonSet
+        metadata:
+          name: http-server
+          labels:
+            app: http-server
+        spec:
+          selector:
+            matchLabels:
+              app: http-server
+          template:
+            metadata:
+              labels:
+                app: http-server
+            spec:
+              hostNetwork: true
+              containers:
+              - name: http-server
+                image: python:3.9-slim
+                command: ["python3"]
+                args: ["/opt/http_server.py"]
+                ports:
+                - containerPort: 80
+                volumeMounts:
+                - name: http-server-script
+                  mountPath: /opt/http_server.py
+                  subPath: http_server.py
+              volumes:
+              - name: http-server-script
+                hostPath:
+                  path: /opt/http_server.py
+                  type: File
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: http-server-service
+        spec:
+          selector:
+            app: http-server
+          ports:
+            - protocol: TCP
+              port: 80
+              targetPort: 80
+              nodePort: 30080
+          type: NodePort
+        EOF
+      when: inventory_hostname in groups['master']
